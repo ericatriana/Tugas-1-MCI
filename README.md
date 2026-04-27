@@ -1,27 +1,67 @@
-# Tugas Modul 1 Open Recruitment Lab MCI 2026 — Text Processing & TF-IDF pada Steam Game Reviews
+# Text Processing & TF-IDF pada Steam Game Reviews: Mengekstrak Signature Keywords dengan Apache Spark
 
-> **Dataset:** steam_game_reviews.csv | **Tools:** PySpark, Scikit-learn, NLTK, Matplotlib
+**Laporan Tugas Modul 1 — Open Recruitment Lab MCI 2026**
+
+---
+
+> *"Setiap game punya ceritanya sendiri — dan ulasan para pemain menyimpan jejak kata-kata yang paling merepresentasikannya. Tugas kita adalah menemukannya."*
 
 ---
 
 ## Pendahuluan
 
-Tugas pertama dalam rangkaian Open Recruitment Lab MCI 2026 ini berfokus pada pemrosesan teks (*text processing*) menggunakan dataset ulasan game dari Steam. Tujuannya adalah mengekstrak **signature keywords** — kata-kata yang paling merepresentasikan tiap judul game — menggunakan pendekatan TF-IDF tanpa bantuan kamus stopword eksternal.
+Bayangkan kamu memiliki jutaan ulasan game dari Steam. Bukan satu-dua, tapi ribuan review dari ratusan judul berbeda. Bagaimana cara menemukan kata-kata yang paling "mewakili" sebuah game tanpa membacanya satu per satu?
 
-Pipeline yang dibangun mencakup lima tahap utama: *data loading & selection*, *data cleaning*, *tokenization*, *TF-IDF implementation*, dan *signature keyword extraction*. Sebagai nilai tambah, diterapkan pula PySpark sebagai engine pemrosesan terdistribusi, lemmatization dengan NLTK, dan visualisasi distribusi IDF.
+Inilah tantangan yang diselesaikan dalam tugas ini: membangun pipeline **Text Processing + TF-IDF** menggunakan **Apache Spark** untuk mengekstrak *signature keywords* — kata-kata yang paling khas dan representatif untuk setiap game di dataset Steam.
+
+### Dataset
+
+Dataset yang digunakan adalah **`steam_game_reviews.csv`**, berisi kolom-kolom seperti `game_name`, `username`, `review`, dan berbagai metadata lainnya. Dari keseluruhan kolom tersebut, hanya tiga yang relevan untuk analisis ini:
+
+| Kolom | Deskripsi |
+|---|---|
+| `game_name` | Nama judul game |
+| `username` | Nama pengguna yang memberikan review |
+| `review` | Teks ulasan dari pemain |
+
+### Tech Stack
+
+| Teknologi | Kegunaan |
+|---|---|
+| **Apache Spark (PySpark)** | Distributed computing untuk memproses data besar |
+| **Spark ML (CountVectorizer + IDF)** | Implementasi TF-IDF skala besar |
+| **NLTK (WordNetLemmatizer)** | Lemmatization sebagai metode tambahan |
+| **Matplotlib & Seaborn** | Visualisasi distribusi IDF |
+| **Pandas** | Inspeksi dan presentasi hasil akhir |
 
 ---
 
-## 1. Persiapan Data (Data Loading & Selection)
+## Mengapa Apache Spark?
 
-Dataset dibaca menggunakan **PySpark** (`SparkSession`) agar mampu menangani data dalam skala besar secara efisien.
+Sebelum masuk ke pipeline, ada pertanyaan mendasar: *kenapa tidak pakai Pandas saja?*
+
+Dataset Steam game reviews bisa sangat besar — dengan ratusan ribu hingga jutaan baris review. Pandas memuat semua data ke RAM (in-memory), yang akan menjadi bottleneck pada dataset besar. Apache Spark menggunakan paradigma **distribusi komputasi**, artinya pemrosesan dibagi ke beberapa worker (atau core CPU) secara paralel, sehingga jauh lebih skalabel.
+
+Selain itu, Spark ML menyediakan implementasi **CountVectorizer** dan **IDF** yang natively bekerja pada DataFrame terdistribusi — sangat cocok untuk kasus ini.
 
 ```python
 spark = SparkSession.builder \
     .appName("BigData_Day1_MMDS") \
     .master("local[*]") \
     .getOrCreate()
+```
 
+Dengan `local[*]`, Spark akan menggunakan semua core CPU yang tersedia pada mesin lokal — ini sudah jauh lebih cepat dari single-threaded Pandas untuk data besar.
+
+---
+
+## Step 1: Persiapan Data (Data Loading & Selection)
+
+### Loading Dataset
+
+Dataset CSV dimuat menggunakan Spark dengan opsi `multiLine=True` dan `escape='"'` untuk menangani review yang mengandung karakter khusus atau newline di dalam satu cell:
+
+```python
 df_raw = spark.read.csv(
     '/content/steam_game_reviews.csv',
     header=True,
@@ -31,35 +71,40 @@ df_raw = spark.read.csv(
 ).cache()
 ```
 
-Setelah data dimuat, dilakukan **seleksi kolom** — hanya tiga kolom yang digunakan sesuai instruksi tugas:
+Opsi `.cache()` penting di sini — ini memberitahu Spark untuk menyimpan DataFrame di memori setelah pertama kali dihitung, sehingga operasi berikutnya tidak perlu membaca ulang dari disk.
+
+### Seleksi Kolom
+
+Dari seluruh kolom yang tersedia, hanya tiga kolom yang dipertahankan:
 
 ```python
 COLS = ['game_name', 'username', 'review']
 spark_df = df_raw.select(*COLS)
 ```
 
-**Mengapa PySpark?**
-Steam game reviews adalah dataset bertipe *user-generated content* yang bisa sangat besar. PySpark memungkinkan distribusi komputasi ke multiple core (bahkan cluster), sehingga pipeline tetap scalable saat data tumbuh.
+Melakukan seleksi kolom di awal bukan hanya soal kerapian kode — ini juga menghemat memori dan mempercepat operasi downstream karena Spark tidak perlu membawa kolom yang tidak diperlukan melalui seluruh pipeline.
 
 ---
 
-## 2. Pembersihan Data (Data Cleaning)
+## Step 2: Pembersihan Data (Data Cleaning)
 
 ### Deteksi Missing Values
 
-Sebelum cleaning, dilakukan pemeriksaan terhadap setiap kolom untuk menemukan nilai null atau string kosong:
+Sebelum melakukan pembersihan, dilakukan audit missing values untuk setiap kolom:
 
 ```python
 for c in spark_df.columns:
     null_count = spark_df.filter(
         col(c).isNull() | (trim(col(c).cast('string')) == '')
     ).count()
-    print(f"{c:<15}: {null_count} missing")
+    print(f"  {c:<15}: {null_count} missing")
 ```
 
-### Penghapusan Baris Tidak Valid
+Pemeriksaan ini menggabungkan dua kondisi: nilai `null` (benar-benar kosong di level SQL) dan string kosong setelah di-trim (nilai `''` atau `'   '`). Keduanya perlu ditangani agar tidak ada review "palsu" yang masuk ke pipeline.
 
-Baris dengan `review` atau `game_name` yang null/kosong dihapus:
+### Menghapus Data Kotor
+
+Baris yang memiliki `review` atau `game_name` yang null/kosong dihapus:
 
 ```python
 df_clean = spark_df \
@@ -70,30 +115,40 @@ df_clean = spark_df \
 
 ### Normalisasi Teks
 
-Normalisasi dilakukan secara berurutan menggunakan PySpark SQL functions:
+Inilah inti dari tahap cleaning: mengubah teks mentah menjadi format yang konsisten dan bersih. Dilakukan serangkaian transformasi secara berurutan (method chaining):
 
 ```python
 df_clean = df_clean \
-    .withColumn('review_clean', lower(col('review')))                                   # lowercase
-    .withColumn('review_clean', regexp_replace(..., r'https?://\S+|www\.\S+', ' '))    # hapus URL
-    .withColumn('review_clean', regexp_replace(..., r'<[^>]+>', ' '))                   # hapus HTML tag
-    .withColumn('review_clean', regexp_replace(..., r'[^a-z\s]', ' '))                  # hapus non-alphabet
-    .withColumn('review_clean', regexp_replace(..., r'\s+', ' '))                        # normalisasi spasi
+    .withColumn('review_clean', lower(col('review'))) \
+    .withColumn('review_clean', regexp_replace(col('review_clean'), r'https?://\S+|www\.\S+', ' ')) \
+    .withColumn('review_clean', regexp_replace(col('review_clean'), r'<[^>]+>', ' ')) \
+    .withColumn('review_clean', regexp_replace(col('review_clean'), r'[^a-z\s]', ' ')) \
+    .withColumn('review_clean', regexp_replace(col('review_clean'), r'\s+', ' ')) \
     .withColumn('review_clean', trim(col('review_clean')))
 ```
 
-Langkah-langkah pembersihan:
-- **Lowercase** — menyeragamkan kapitalisasi
-- **Hapus URL** — link tidak mengandung makna semantik
-- **Hapus HTML tag** — artifact dari web scraping
-- **Hapus karakter non-alfabet** — angka, tanda baca, simbol
-- **Normalisasi whitespace** — hapus spasi berlebih
+Setiap langkah memiliki fungsi spesifik:
+
+| Langkah | Regex | Tujuan |
+|---|---|---|
+| Lowercase | — | Menyamakan kapital (`Game` = `game`) |
+| URL removal | `https?://\S+\|www\.\S+` | Hapus tautan web |
+| HTML tag removal | `<[^>]+>` | Hapus tag HTML seperti `<br>`, `<b>` |
+| Non-alpha removal | `[^a-z\s]` | Hapus angka, tanda baca, emoji |
+| Whitespace normalization | `\s+` | Satukan multiple spasi menjadi satu |
+
+**Contoh transformasi:**
+
+```
+BEFORE: "This game is AMAZING!! 10/10 would recommend. Check https://store.steampowered.com"
+AFTER : "this game is amazing would recommend check"
+```
 
 ---
 
-## 3. Tokenization
+## Step 3: Tokenization
 
-Tokenisasi dilakukan dengan memecah teks berdasarkan spasi menggunakan fungsi `split` dari PySpark:
+Tokenisasi adalah proses memecah teks menjadi unit-unit kata (token). Di sini digunakan fungsi `split` dari PySpark yang memotong string berdasarkan spasi:
 
 ```python
 df_tokenized = df_clean \
@@ -101,7 +156,9 @@ df_tokenized = df_clean \
     .withColumn('token_count', size(col('tokens')))
 ```
 
-Setelah tokenisasi, dilakukan **filter outlier**: review dengan kurang dari 3 token dihapus karena terlalu pendek untuk menghasilkan sinyal TF-IDF yang bermakna.
+### Filter Review Pendek
+
+Setelah tokenisasi, review dengan kurang dari 3 token dibuang. Review yang terlalu pendek (misalnya hanya "good" atau "ok") tidak memberikan sinyal kata yang bermakna untuk analisis TF-IDF:
 
 ```python
 df_filtered = df_tokenized.filter(col('token_count') >= 3)
@@ -109,82 +166,156 @@ df_filtered = df_tokenized.filter(col('token_count') >= 3)
 
 ---
 
-## 4. Implementasi TF-IDF
+## Step 4: Implementasi TF-IDF
 
-### Strategi: Dokumen per Game
+Ini adalah inti dari seluruh pipeline. Sebelum membahas implementasinya, penting untuk memahami konsep dasarnya.
 
-Alih-alih memperlakukan setiap review sebagai satu dokumen terpisah, seluruh review dalam satu game digabungkan menjadi **satu corpus**. Ini membuat TF-IDF mencerminkan kata yang paling khas untuk keseluruhan game tersebut.
+### Apa itu TF-IDF?
 
-### CountVectorizer + IDF (PySpark ML)
+**TF-IDF (Term Frequency–Inverse Document Frequency)** adalah metrik yang mengukur seberapa penting sebuah kata dalam sebuah dokumen relatif terhadap kumpulan dokumen lainnya (corpus).
+
+- **TF (Term Frequency)**: Seberapa sering sebuah kata muncul dalam satu dokumen.
+- **IDF (Inverse Document Frequency)**: Kebalikan dari seberapa sering kata tersebut muncul di *semua* dokumen. Kata yang ada di semua dokumen (seperti "the", "is", "and") mendapat IDF rendah, sehingga bobotnya kecil meskipun sering muncul.
+
+Rumus IDF:
+
+```
+IDF(t) = log((N + 1) / (df(t) + 1))
+```
+
+Di mana `N` adalah jumlah total dokumen dan `df(t)` adalah jumlah dokumen yang mengandung kata `t`. Nilai `+1` pada penyebut digunakan untuk menghindari pembagian nol (smoothing).
+
+**TF-IDF = TF × IDF**
+
+Kata yang sering muncul dalam satu dokumen spesifik tapi jarang di dokumen lain akan memiliki skor TF-IDF tinggi — itulah yang kita cari sebagai *signature keyword*.
+
+### 4a: CountVectorizer
+
+`CountVectorizer` dari Spark ML membangun vocabulary dari semua token dan menghitung frekuensi setiap kata per dokumen (Term Frequency):
 
 ```python
-from pyspark.ml.feature import CountVectorizer, IDF
-
-# Bangun vocabulary
 cv = CountVectorizer(
     inputCol='tokens',
     outputCol='tf_features',
-    vocabSize=20000,  # maksimal 20.000 kata unik
-    minDF=5           # kata harus muncul di minimal 5 dokumen
+    vocabSize=20000,   # maksimal 20.000 kata unik
+    minDF=5            # kata harus muncul di minimal 5 dokumen
 )
+
 cv_model = cv.fit(df_filtered)
 vocabulary = cv_model.vocabulary
+df_tf = cv_model.transform(df_filtered)
+```
 
-# Hitung IDF
-idf = IDF(inputCol='tf_features', outputCol='tfidf_features', minDocFreq=5)
+Parameter `minDF=5` berarti kata yang hanya muncul di kurang dari 5 dokumen tidak masuk vocabulary. Ini adalah cara sederhana untuk membuang kata-kata sangat langka yang mungkin hanya typo atau nama unik.
+
+**Mengapa CountVectorizer, bukan HashingTF?**
+
+CountVectorizer menyimpan vocabulary eksplisit (berupa list kata), sehingga kita bisa tahu persis kata mana yang dipilih. HashingTF lebih cepat tapi tidak menyimpan mapping kata → indeks, sehingga hasilnya tidak interpretable secara langsung.
+
+### 4b: IDF Computation
+
+Setelah mendapat TF, langkah berikutnya menghitung IDF:
+
+```python
+idf = IDF(
+    inputCol='tf_features',
+    outputCol='tfidf_features',
+    minDocFreq=5
+)
+
 idf_model = idf.fit(df_tf)
 df_tfidf = idf_model.transform(df_tf)
 idf_values = idf_model.idf.toArray()
 ```
 
-### Penentuan Threshold IDF
+`idf_model.idf` menghasilkan vektor IDF untuk setiap kata dalam vocabulary. Nilai ini kemudian digunakan untuk menentukan threshold.
 
-Alih-alih menggunakan kamus stopword, kata-kata umum diidentifikasi secara **otomatis berdasarkan distribusi IDF**. Kata dengan IDF terlalu rendah berarti muncul di hampir semua dokumen — itulah stopword alami.
+### 4c: IDF Threshold — Stopword Removal Otomatis
+
+Inilah keunikan pendekatan ini: **tidak menggunakan kamus stopword eksternal**. Sebaliknya, kata-kata umum diidentifikasi secara otomatis menggunakan distribusi IDF itu sendiri.
+
+Threshold ditentukan menggunakan **persentil ke-20** dari seluruh nilai IDF:
 
 ```python
 IDF_THRESHOLD = float(np.percentile(idf_values, 20))
 ```
 
-Threshold dipilih di **persentil ke-20**: artinya 20% kata dengan IDF terendah (paling umum) otomatis disingkirkan. Pendekatan ini *data-driven* — threshold menyesuaikan diri dengan karakteristik dataset, bukan hardcoded.
+Kata-kata dengan IDF di bawah threshold ini dianggap "terlalu umum" dan dibuang. Secara statistik, ini berarti 20% kata dengan IDF terendah (paling sering muncul di banyak dokumen) dikeluarkan dari analisis.
 
-Contoh kata yang dihapus otomatis (IDF sangat rendah): *game*, *play*, *the*, *and*, *get*, *really* — kata-kata yang muncul di hampir semua review tanpa membedakan satu game dari yang lain.
+**Mengapa percentile ke-20?**
+
+Ini adalah pilihan yang cukup konservatif — hanya membuang kata-kata yang benar-benar paling umum. Nilai yang lebih tinggi (misalnya 30 atau 40) akan membuang lebih banyak kata, berpotensi kehilangan kata bermakna. Nilai yang terlalu rendah (5-10) mungkin tidak cukup memfilter stopword alami.
+
+### 4d: Visualisasi Distribusi IDF
+
+Visualisasi membantu kita memvalidasi bahwa threshold yang dipilih masuk akal:
+
+```python
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+# Histogram distribusi IDF
+axes[0].hist(idf_values, bins=60, color='steelblue', edgecolor='white')
+axes[0].axvline(IDF_THRESHOLD, color='red', linestyle='--', linewidth=2,
+                label=f'Threshold = {IDF_THRESHOLD:.2f}')
+axes[0].set_title('Distribusi IDF Values')
+
+# Bar chart 20 kata paling umum
+axes[1].barh(words_common[::-1], idf_common[::-1], color='salmon')
+axes[1].set_title('20 Kata Paling Umum (IDF Terendah)')
+```
+
+Dari histogram, kita bisa melihat distribusi IDF: kata-kata dengan IDF mendekati nol adalah kata-kata sangat umum seperti "game", "play", "the". Garis merah vertikal menunjukkan di mana threshold berada — semua kata di sebelah kiri threshold dibuang.
 
 ---
 
-## 5. Ekstraksi Signature Keywords
+## Step 5: Ekstraksi Signature Keywords
 
-### UDF untuk Ekstraksi Keyword per Review
+### 5a: UDF untuk Ekstraksi Keywords per Review
 
-Sebuah *User Defined Function* (UDF) dibuat untuk mengekstrak top-N kata berdasarkan skor TF-IDF dari setiap review:
+Dibuat sebuah **User Defined Function (UDF)** yang mengekstrak top-5 kata dengan skor TF-IDF tertinggi dari setiap review, dengan syarat:
+1. Kata ada dalam `filtered_vocab` (IDF ≥ threshold)
+2. Panjang kata lebih dari 2 karakter (skip kata sangat pendek seperti "ok", "no")
 
 ```python
+vocab_bc = spark.sparkContext.broadcast(vocabulary)
+filtered_vocab_bc = spark.sparkContext.broadcast(filtered_vocab)
+
 def extract_top_keywords(tfidf_vector, n=5):
+    if tfidf_vector is None:
+        return []
     vocab = vocab_bc.value
     fv = filtered_vocab_bc.value
     word_scores = []
     for idx, val in zip(tfidf_vector.indices, tfidf_vector.values):
         if idx < len(vocab):
             word = vocab[idx]
-            if word in fv and len(word) > 2:  # skip kata < 3 huruf
+            if word in fv and len(word) > 2:
                 word_scores.append((word, float(val)))
     word_scores.sort(key=lambda x: x[1], reverse=True)
     return [w for w, s in word_scores[:n]]
 ```
 
-### Akumulasi Keyword per Game
+**Catatan tentang Broadcast Variables:**
 
-Top-5 keyword per review di-*explode*, lalu dihitung frekuensi kemunculannya sebagai keyword unggulan di seluruh review dalam satu game. Top-3 dengan accumulated score tertinggi dijadikan `signature_keywords`:
+`spark.sparkContext.broadcast()` digunakan untuk mendistribusikan vocabulary dan filtered_vocab ke semua worker Spark secara efisien. Tanpa broadcast, Spark akan mengirimkan data ini berulang kali ke setiap task — sangat tidak efisien untuk vocabulary berukuran ribuan kata.
+
+### 5b: Akumulasi Signature Keywords per Game
+
+Setelah mendapat top keywords per review, dilakukan akumulasi untuk mendapatkan kata yang paling "representatif" untuk seluruh game, bukan hanya satu review:
 
 ```python
+# Explode: satu baris per (game_name, keyword)
 keywords_exploded = df_tfidf.select(
     col('game_name'),
     explode(col('review_keywords')).alias('keyword')
 )
 
+# Hitung berapa kali kata muncul sebagai top keyword di review game tersebut
 keyword_counts = keywords_exploded \
     .groupBy('game_name', 'keyword') \
     .agg(count('*').alias('accumulated_score'))
 
+# Ambil top-3 per game
 window_game = Window.partitionBy('game_name').orderBy(col('accumulated_score').desc())
 
 top3_df = keyword_counts \
@@ -194,72 +325,166 @@ top3_df = keyword_counts \
     .agg(collect_list('keyword').alias('signature_keywords'))
 ```
 
-### Hasil: Kolom `signature_keywords`
+**Logika di balik akumulasi:**
 
-Kolom baru `signature_keywords` di-join kembali ke DataFrame utama. Setiap game kini memiliki 2–3 kata paling representatif yang mencerminkan konten ulasan penggunanya.
+Daripada mengambil rata-rata skor TF-IDF (yang bisa menyesatkan karena skala berbeda per review), pendekatan ini menghitung **berapa kali** sebuah kata muncul sebagai top keyword di semua review game tersebut. Kata yang konsisten muncul sebagai top keyword di banyak review kemungkinan besar memang menjadi kata khas game itu.
 
-Contoh hasil (ilustratif):
+### 5c: Join ke DataFrame Utama
 
-| game_name | signature_keywords |
-|---|---|
-| Counter-Strike: Global Offensive | competitive, fps, match |
-| Stardew Valley | farm, relaxing, cozy |
-| The Witcher 3 | story, open_world, rpg |
-| Terraria | sandbox, boss, craft |
+Hasil signature keywords digabungkan kembali ke DataFrame utama:
+
+```python
+df_final = df_tfidf.join(top3_df, on='game_name', how='left')
+```
+
+Dengan `left join`, semua baris dari `df_tfidf` dipertahankan — game yang tidak memiliki keywords (misalnya karena terlalu sedikit data) tetap ada dengan nilai null di kolom `signature_keywords`.
+
+### 5d: Tabel Hasil Akhir
+
+```python
+summary_pd = top3_df.orderBy('game_name').toPandas()
+summary_pd['signature_keywords'] = summary_pd['signature_keywords'].apply(
+    lambda x: ', '.join(x) if isinstance(x, list) else x
+)
+```
+
+Hasil akhir berupa tabel yang menunjukkan 2-3 kata paling khas untuk setiap game dalam dataset.
 
 ---
 
-## Metode Tambahan (Nilai Plus)
+## Metode Tambahan: Teknik-Teknik yang Memperkuat Pipeline
 
-### 🔹 PySpark sebagai Distributed Computing Engine
+Selain langkah-langkah wajib, terdapat beberapa teknik tambahan yang diterapkan untuk meningkatkan kualitas hasil.
 
-Alasan: Dataset ulasan Steam bisa mencapai jutaan baris. PySpark memungkinkan pemrosesan paralel di atas cluster, sehingga pipeline tidak bottleneck saat data di-scale up.
+### 1. Broadcast Variables untuk Efisiensi Distribusi
 
-### 🔹 Lemmatization dengan NLTK WordNetLemmatizer
+Seperti dijelaskan sebelumnya, vocabulary dan filtered_vocab di-broadcast ke semua worker Spark. Ini mencegah Spark mengirim data berulang kali dan signifikan mempercepat eksekusi UDF.
 
-Sebelum TF-IDF dihitung, setiap token di-lemmatize — kata seperti *playing*, *played*, *plays* akan dikembalikan ke bentuk dasar *play*. Ini mengurangi inflasi vocabulary dan membuat kata-kata yang secara semantik sama tidak terhitung sebagai entitas berbeda.
+```python
+vocab_bc = spark.sparkContext.broadcast(vocabulary)
+filtered_vocab_bc = spark.sparkContext.broadcast(filtered_vocab)
+```
+
+**Mengapa ini penting:** Tanpa broadcast, setiap task Spark (bisa ratusan) akan menerima salinan vocabulary tersendiri melalui jaringan. Dengan broadcast, data dikirim sekali ke setiap executor, lalu di-cache lokal.
+
+### 2. DataFrame Caching (`.cache()`)
+
+Beberapa DataFrame di-cache untuk menghindari re-computation:
+
+```python
+df_raw = spark.read.csv(...).cache()
+```
+
+Spark secara default mengevaluasi transformasi secara *lazy* — artinya tidak dieksekusi sampai ada action (seperti `count()` atau `show()`). Tanpa `.cache()`, jika DataFrame diakses dua kali, Spark akan membaca ulang file dari disk dua kali. Caching menyimpan hasilnya di memori.
+
+### 3. Window Function untuk Ranking
+
+Penggunaan `Window.partitionBy('game_name').orderBy(...)` memungkinkan ranking per game dilakukan dalam satu pass, tanpa perlu loop atau groupby yang terpisah:
+
+```python
+window_game = Window.partitionBy('game_name').orderBy(col('accumulated_score').desc())
+top3_df = keyword_counts \
+    .withColumn('rnk', rank().over(window_game)) \
+    .filter(col('rnk') <= 3)
+```
+
+Ini adalah pola SQL-style yang sangat efisien di Spark dan jauh lebih ekspresif dibanding alternatif imperatif.
+
+### 4. Integrasi NLTK WordNetLemmatizer (Nilai Plus)
+
+Library NLTK diimpor untuk lemmatization — proses mengubah kata ke bentuk dasarnya (misalnya "playing" → "play", "games" → "game"). Ini dapat meningkatkan kualitas TF-IDF karena variasi kata yang berbeda (but bermakna sama) akan dikelompokkan menjadi satu token.
 
 ```python
 from nltk.stem import WordNetLemmatizer
 lemmatizer = WordNetLemmatizer()
-# diaplikasikan saat preprocessing token
 ```
 
-### 🔹 Data-driven Stopword Removal via IDF Percentile
+Lemmatization berbeda dari stemming: stemming memotong akhiran secara mekanis (bisa menghasilkan kata tidak valid seperti "happi"), sedangkan lemmatization menggunakan kamus linguistik untuk menghasilkan bentuk kata yang valid.
 
-Tidak menggunakan kamus stopword hardcoded, melainkan menghitung percentile distribusi IDF. Pendekatan ini adaptif: untuk genre game tertentu, kata "combat" mungkin umum (IDF rendah), tapi di dataset lain bisa menjadi keyword penting.
+**Kapan ini berguna?** Misalnya, dalam review gaming, kata "bought", "buy", "buying" semuanya merujuk ke konsep yang sama. Dengan lemmatization, ketiganya jadi "buy" — memperkuat sinyal TF-IDF untuk kata tersebut.
 
-### 🔹 Visualisasi Distribusi IDF
+### 5. Multi-layer Text Cleaning
 
-Dibuat dua visualisasi:
-1. **Histogram distribusi IDF** dengan garis threshold, untuk memverifikasi pemilihan batas secara visual
-2. **Bar chart 20 kata paling umum** (IDF terendah) yang tersingkir sebagai stopword otomatis
+Pipeline cleaning tidak hanya lowercase, tapi juga mencakup:
+- **URL removal**: Review gamer sering mencantumkan link (YouTube, Steam Store, wiki)
+- **HTML tag removal**: Dataset Steam kadang mengandung HTML dari sistem review
+- **Character normalization**: Angka, emoji, dan tanda baca dihapus untuk fokus pada kata bermakna
 
-```python
-fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-axes[0].hist(idf_values, bins=60, ...)
-axes[0].axvline(IDF_THRESHOLD, color='red', linestyle='--', ...)
-axes[1].barh(words_common[::-1], idf_common[::-1], ...)
-plt.savefig('idf_distribution.png', ...)
+---
+
+## Alur Pipeline Lengkap
+
+```
+Raw CSV
+   │
+   ▼
+[1] Load & Select Columns
+   │  (game_name, username, review)
+   ▼
+[2] Data Cleaning
+   │  - Remove nulls/empty
+   │  - Lowercase, remove URL, HTML, non-alpha
+   │  - Normalize whitespace
+   ▼
+[3] Tokenization
+   │  - split(' ') → array of tokens
+   │  - Filter: token_count >= 3
+   ▼
+[4] TF-IDF Pipeline (Spark ML)
+   │  ┌─ CountVectorizer (vocab: 20K, minDF: 5)
+   │  └─ IDF (minDocFreq: 5)
+   │  - Determine IDF threshold (percentile 20)
+   │  - Auto-identify stopwords via IDF
+   ▼
+[5] Signature Keyword Extraction
+   │  - UDF: top-5 keywords per review
+   │  - Explode + GroupBy: accumulated score per game
+   │  - Window rank: top-3 per game
+   ▼
+df_final dengan kolom signature_keywords
 ```
 
-### 🔹 Accumulated Score sebagai Proxy Relevansi
+---
 
-Signature keyword dipilih bukan hanya dari satu review dengan TF-IDF tertinggi, melainkan dari kata yang **paling sering muncul sebagai top keyword di semua review game tersebut**. Ini membuat signature keywords lebih robust terhadap outlier review dan lebih merepresentasikan konsensus komunitas.
+## Refleksi dan Insight
+
+### Apa yang Menarik dari Pendekatan Ini?
+
+**TF-IDF tanpa kamus stopword** adalah pendekatan yang elegan. Alih-alih bergantung pada daftar kata buatan manusia yang bersifat statis dan bahasa-spesifik, IDF secara alami mengidentifikasi kata-kata umum dari data itu sendiri. Kata seperti "game", "play", "fun" yang mungkin tidak ada di stopword list standar akan mendapat IDF rendah karena muncul di hampir semua review — dan otomatis ter-downweight.
+
+### Keterbatasan
+
+Beberapa hal yang bisa ditingkatkan ke depannya:
+
+1. **Context-blind**: TF-IDF tidak memahami semantik. Kata "dark" dan "darkness" dianggap berbeda, dan relasi antar kata tidak ditangkap.
+2. **Review length bias**: Review panjang cenderung mengandung lebih banyak kata, yang bisa mendominasi akumulasi keyword jika tidak dinormalisasi.
+3. **Multibahasa**: Dataset Steam mengandung review dalam berbagai bahasa. Pipeline ini berasumsi review berbahasa Inggris; review dalam bahasa lain akan menghasilkan token yang tidak bermakna.
+
+### Pengembangan Lebih Lanjut
+
+- **Word2Vec / BERT Embeddings**: Untuk menangkap semantik dan sinonim
+- **BM25**: Alternatif TF-IDF yang memiliki normalisasi panjang dokumen lebih baik
+- **LDA (Latent Dirichlet Allocation)**: Untuk topic modeling yang lebih kaya
 
 ---
 
 ## Kesimpulan
 
-Pipeline yang dibangun berhasil mengekstrak signature keywords dari dataset ulasan Steam tanpa menggunakan kamus stopword eksternal. Beberapa poin kunci:
+Pipeline yang dibangun dalam tugas ini berhasil mengekstrak *signature keywords* dari dataset Steam game reviews menggunakan pendekatan berbasis **TF-IDF murni** (tanpa kamus stopword eksternal). Dengan memanfaatkan kekuatan **Apache Spark** untuk distributed computing, pipeline ini skalabel dan dapat dijalankan pada dataset jauh lebih besar.
 
-- **TF-IDF berbasis corpus per game** lebih efektif daripada per-review karena mencerminkan karakteristik keseluruhan game
-- **Threshold IDF otomatis via percentile** adalah pendekatan yang data-driven dan tidak bergantung pada bahasa tertentu
-- **PySpark** membuat pipeline ini scalable untuk dataset yang lebih besar
-- **Accumulated scoring** membuat keyword yang terpilih lebih representatif dan tahan terhadap noise
-
-Hasilnya adalah kolom `signature_keywords` yang berisi 2–3 kata yang paling khas untuk setiap judul game, diturunkan murni dari pola statistik dalam teks ulasan pengguna.
+Kata-kata dengan akumulasi skor TF-IDF tertinggi per game berhasil diidentifikasi sebagai representasi paling khas dari setiap judul — mencerminkan apa yang paling sering dibicarakan pemain tentang game tersebut.
 
 ---
 
-*Tugas ini dikerjakan sebagai bagian dari Open Recruitment Admin Lab MCI 2026.*
+## Referensi
+
+- [Apache Spark Documentation — MLlib Feature Extraction](https://spark.apache.org/docs/latest/ml-features.html)
+- [Scikit-learn TF-IDF Documentation](https://scikit-learn.org/stable/modules/generated/sklearn.feature_extraction.text.TfidfVectorizer.html)
+- [NLTK WordNet Lemmatizer](https://www.nltk.org/api/nltk.stem.wordnet.html)
+- Salton, G., & Buckley, C. (1988). *Term-weighting approaches in automatic text retrieval*. Information Processing & Management.
+- [Steam Game Reviews Dataset](https://drive.google.com/file/d/1CuaoMAUII9iyVcqaSdthnl6IdUvYPoLS/view?usp=sharing)
+
+---
+
+*Tugas Modul 1 — Open Recruitment Lab MCI 2026*
+*Dibuat menggunakan Python, Apache PySpark, dan Spark MLlib*
